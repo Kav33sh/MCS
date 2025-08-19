@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Motion-Copying System (Web Demo) — Katsura-aligned</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <!-- Plotly for charts -->
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    :root{
+      --bg:#0f172a; --card:#111827; --ink:#e5e7eb; --muted:#94a3b8; --accent:#22d3ee;
+      --btn:#1f2937; --btnh:#374151; --ok:#22c55e; --warn:#f59e0b;
+    }
+    *{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    body{margin:0;background:linear-gradient(180deg,#0b1222,#0a0f1a);color:var(--ink)}
+    header{padding:20px 24px;border-bottom:1px solid #1f2937;background:rgba(17,24,39,.7);backdrop-filter:blur(6px);position:sticky;top:0;z-index:10}
+    h1{font-size:20px;margin:0}
+    main{max-width:1200px;margin:24px auto;padding:0 16px;display:grid;grid-template-columns:360px 1fr;gap:16px}
+    .card{background:var(--card);border:1px solid #1f2937;border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    .title{font-size:14px;color:var(--muted);margin:0 0 6px}
+    canvas{background:#0b1222;border:1px dashed #334155;border-radius:12px;display:block;width:100%;height:auto}
+    .controls label{display:block;font-size:12px;color:var(--muted);margin-top:10px}
+    .controls input[type="number"], .controls input[type="range"]{width:100%}
+    .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+    button{background:var(--btn);color:var(--ink);border:1px solid #374151;border-radius:10px;padding:10px 12px;cursor:pointer}
+    button:hover{background:var(--btnh)}
+    .pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;background:#0b1324;border:1px solid #1f2937;color:var(--muted);font-size:12px}
+    .metrics{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    .metric{background:#0c1629;border:1px solid #1f2937;border-radius:10px;padding:8px 10px;font-size:12px}
+    .ok{color:var(--ok)} .warn{color:var(--warn)}
+    footer{max-width:1200px;margin:24px auto;padding:0 16px 40px;color:#a3a3a3;font-size:12px}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Motion-Copying System (MCS) — Web Demo (Wave/Teleop theme)</h1>
+</header>
+
+<main>
+  <!-- LEFT: Recording + Controls -->
+  <section class="card">
+    <p class="title">1) Draw on the pad (hold left mouse). Click “Process & Replay”.</p>
+    <canvas id="pad" width="320" height="320"></canvas>
+
+    <div class="controls">
+      <div class="row">
+        <button id="btnClear">Clear</button>
+        <button id="btnProcess">Process & Replay</button>
+        <button id="btnExport">Export CSV</button>
+      </div>
+
+      <label>Recording duration (s)
+        <input id="dur" type="number" value="6" min="2" max="20" step="1">
+      </label>
+
+      <label>Delay (ms) <span class="pill">simulates network/teleop latency</span>
+        <input id="delay" type="number" value="80" min="0" max="300" step="10">
+      </label>
+
+      <label>PD gains (Kp1, Kp2)
+        <input id="kp1" type="number" value="60" step="5"> 
+        <input id="kp2" type="number" value="40" step="5">
+      </label>
+
+      <label>PD gains (Kd1, Kd2)
+        <input id="kd1" type="number" value="0.9" step="0.1"> 
+        <input id="kd2" type="number" value="0.7" step="0.1">
+      </label>
+
+      <label>Smoothing (0.05–0.3) 
+        <input id="alpha" type="range" min="0.05" max="0.3" step="0.01" value="0.15">
+      </label>
+
+      <div class="metrics" id="metrics"></div>
+    </div>
+  </section>
+
+  <!-- RIGHT: Charts -->
+  <section class="card">
+    <p class="title">2) Reference vs Replay & Tracking Error</p>
+    <div id="plotPath" style="height:360px;"></div>
+    <div id="plotErr" style="height:260px;margin-top:10px;"></div>
+    <div class="pill" style="margin-top:8px">Link lengths: L1=0.25 m, L2=0.20 m (2-link planar arm)</div>
+  </section>
+</main>
+
+<footer>
+  Tip: draw within the pad; keep one continuous stroke for a smooth trajectory. This demo resamples to 150 Hz, low-passes your motion, converts to joint targets via IK, injects a configurable delay, and replays with a PD joint controller — then plots EE reference vs replay and error (RMSE). Future work: add disturbance observer & wave-variable wrapping for delay-passive teleoperation (Katsura lab theme).
+</footer>
+
+<script>
+/* ---------------------- Math helpers ---------------------- */
+const L1 = 0.25, L2 = 0.20;              // meters
+const fs = 150;                          // Hz
+function lowpass(sig, alpha=0.15){
+  const out = new Array(sig.length); out[0] = sig[0];
+  for (let i=1;i<sig.length;i++) out[i] = alpha*sig[i] + (1-alpha)*out[i-1];
+  return out;
+}
+function linspace(a,b,n){ const arr=[]; const d=(b-a)/(n-1); for(let i=0;i<n;i++)arr.push(a+i*d); return arr; }
+function clip(v,min,max){ return Math.max(min, Math.min(max,v)); }
+
+/* IK & FK for 2-link */
+function ik2(x,y, elbowUp=true){
+  const r2 = x*x + y*y;
+  let c2 = (r2 - L1*L1 - L2*L2)/(2*L1*L2);
+  c2 = clip(c2,-1,1);
+  const s2 = Math.sqrt(Math.max(0,1-c2*c2))*(elbowUp?1:-1);
+  const q2 = Math.atan2(s2,c2);
+  const k1 = L1 + L2*c2, k2 = L2*s2;
+  const q1 = Math.atan2(y,x) - Math.atan2(k2,k1);
+  return [q1,q2];
+}
+function fk2(q1,q2){
+  const x = L1*Math.cos(q1) + L2*Math.cos(q1+q2);
+  const y = L1*Math.sin(q1) + L2*Math.sin(q1+q2);
+  return [x,y];
+}
+
+/* ---------------------- Canvas recording ---------------------- */
+const pad = document.getElementById('pad');
+const ctx = pad.getContext('2d');
+ctx.lineWidth = 2; ctx.strokeStyle = '#22d3ee';
+let drawing=false, startTime=0, raw=[];
+const SCALE = 0.003; // px -> m
+
+function resetPad(){
+  ctx.clearRect(0,0,pad.width,pad.height);
+  ctx.fillStyle = '#0b1222'; ctx.fillRect(0,0,pad.width,pad.height);
+  ctx.strokeStyle = '#334155'; ctx.setLineDash([6,4]);
+  ctx.strokeRect(6,6,pad.width-12,pad.height-12);
+  ctx.setLineDash([]);
+  raw = [];
+}
+resetPad();
+
+pad.addEventListener('mousedown', (e)=>{ drawing=true; startTime=performance.now(); ctx.beginPath(); });
+pad.addEventListener('mouseup',   (e)=>{ drawing=false; });
+pad.addEventListener('mouseleave',(e)=>{ drawing=false; });
+pad.addEventListener('mousemove', (e)=>{
+  if(!drawing) return;
+  const rect = pad.getBoundingClientRect();
+  const xpx = e.clientX - rect.left;
+  const ypx = e.clientY - rect.top;
+  const xc = pad.width/2, yc = pad.height/2;
+  // draw
+  if(raw.length===0) ctx.moveTo(xpx, ypx); else ctx.lineTo(xpx, ypx);
+  ctx.stroke();
+  // record (centered, pixels->meters; +y up)
+  const t = (performance.now() - startTime)/1000;
+  const xm = (xpx - xc)*SCALE;
+  const ym = (yc - ypx)*SCALE;
+  raw.push([t,xm,ym]);
+});
+
+/* ---------------------- Processing pipeline ---------------------- */
+function uniformResample(t,x,y, fs=150){
+  const T = t[t.length-1];
+  const N = Math.max(10, Math.ceil(T*fs));
+  const tu = linspace(0,T,N);
+  const xi = new Array(N), yi = new Array(N);
+  let k=0;
+  for(let i=0;i<N;i++){
+    const tt = tu[i];
+    while(k < t.length-2 && t[k+1] < tt) k++;
+    const t0=t[k], t1=t[k+1]??t[k], a=(t1!==t0)?(tt-t0)/(t1-t0):0;
+    xi[i] = x[k]*(1-a)+x[k+1]*(a||0);
+    yi[i] = y[k]*(1-a)+y[k+1]*(a||0);
+  }
+  return [tu, lowpass(xi, getAlpha()), lowpass(yi, getAlpha())];
+}
+
+function pathToJoints(x,y){
+  const q = [];
+  const rmax = L1+L2-1e-3, margin=0.01;
+  for(let i=0;i<x.length;i++){
+    let xi=x[i], yi=y[i];
+    const r = Math.hypot(xi,yi);
+    if(r > rmax - margin){
+      const s = (rmax - margin)/r;
+      xi *= s; yi *= s;
+    }
+    q.push(ik2(xi,yi));
+  }
+  return q;
+}
+
+function delayRefs(arr, delay_ms, fs){
+  const steps = Math.max(0, Math.round(delay_ms/1000*fs));
+  if(steps===0) return arr.slice();
+  const pad = new Array(steps).fill(arr[0]);
+  return pad.concat(arr.slice(0, arr.length-steps));
+}
+
+function replayPD(t, qref, Kp=[60,40], Kd=[0.9,0.7]){
+  const dt = (t[t.length-1]-t[0])/(t.length-1);
+  let q = qref[0].slice(), qd=[0,0];
+  const J=[0.02,0.015], b=[0.05,0.04], k=[0,0];
+  const out=[q.slice()];
+  for(let i=1;i<t.length;i++){
+    const qerr = [qref[i][0]-q[0], qref[i][1]-q[1]];
+    const qdref = [(qref[i][0]-qref[i-1][0])/dt, (qref[i][1]-qref[i-1][1])/dt];
+    const qderr = [qdref[0]-qd[0], qdref[1]-qd[1]];
+    const tau = [Kp[0]*qerr[0]+Kd[0]*qderr[0], Kp[1]*qerr[1]+Kd[1]*qderr[1]];
+    const qdd = [(tau[0]-b[0]*qd[0]-k[0]*q[0])/J[0], (tau[1]-b[1]*qd[1]-k[1]*q[1])/J[1]];
+    qd = [qd[0]+qdd[0]*dt, qd[1]+qdd[1]*dt];
+    q  = [q[0]+qd[0]*dt,   q[1]+qd[1]*dt];
+    out.push(q.slice());
+  }
+  return out;
+}
+
+/* ---------------------- UI & Orchestration ---------------------- */
+const $ = id=>document.getElementById(id);
+const getAlpha = ()=> parseFloat($('alpha').value);
+function metric(label, value, cls=""){ return `<div class="metric ${cls}"><b>${label}:</b> ${value}</div>`; }
+
+$('btnClear').onclick = resetPad;
+
+$('btnProcess').onclick = ()=>{
+  if(raw.length<10){ alert("Please draw a single continuous stroke while holding the left mouse button."); return; }
+
+  // 1) Resample/smooth
+  const t = raw.map(r=>r[0]), x = raw.map(r=>r[1]), y = raw.map(r=>r[2]);
+  const [tu, xu, yu] = uniformResample(t,x,y, fs);
+
+  // 2) IK -> joint reference
+  const qref = pathToJoints(xu,yu);
+
+  // 3) Delay injection
+  const delay = parseFloat($('delay').value)||0;
+  const qref_d = delayRefs(qref, delay, fs);
+
+  // 4) Replay with PD
+  const kp = [parseFloat($('kp1').value)||60, parseFloat($('kp2').value)||40];
+  const kd = [parseFloat($('kd1').value)||0.9, parseFloat($('kd2').value)||0.7];
+  const qrep = replayPD(tu, qref_d, kp, kd);
+
+  // 5) EE traces
+  const eeref = qref.map(q=>fk2(q[0], q[1]));
+  const eerep = qrep.map(q=>fk2(q[0], q[1]));
+  const err = eerep.map((p,i)=> Math.hypot(p[0]-eeref[i][0], p[1]-eeref[i][1]));
+  const rmse = Math.sqrt(err.reduce((s,v)=>s+v*v,0)/err.length);
+  const maxe = Math.max(...err);
+
+  // 6) Plots
+  Plotly.newPlot('plotPath', [
+    {x:eeref.map(p=>p[0]), y:eeref.map(p=>p[1]), name:'reference', mode:'lines', line:{width:3}},
+    {x:eerep.map(p=>p[0]), y:eerep.map(p=>p[1]), name:'replay', mode:'lines', line:{dash:'dash', width:3}}
+  ], {paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+      xaxis:{zeroline:false, gridcolor:'#334155'}, yaxis:{scaleanchor:'x', scaleratio:1, gridcolor:'#334155'},
+      margin:{l:40,r:20,t:40,b:40}, title:'End-effector path (reference vs replay)'},
+     {displayModeBar:false});
+
+  Plotly.newPlot('plotErr', [
+    {x:tu, y:err.map(v=>v*1000), name:'error', mode:'lines', line:{width:2}}
+  ], {paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+      xaxis:{title:'t [s]', gridcolor:'#334155'}, yaxis:{title:'|e| [mm]', gridcolor:'#334155'},
+      margin:{l:60,r:20,t:30,b:50}, title:'Tracking error'},
+     {displayModeBar:false});
+
+  // 7) Metrics UI
+  $('metrics').innerHTML =
+    metric('RMSE', (rmse*1000).toFixed(1)+' mm', rmse<0.8/1000?'ok':'' ) +
+    metric('Max error', (maxe*1000).toFixed(1)+' mm') +
+    metric('Delay', delay.toFixed(0)+' ms') +
+    metric('Samples', tu.length) +
+    metric('α (LPF)', getAlpha().toFixed(2));
+};
+
+/* Export CSV (reference vs replay) */
+$('btnExport').onclick = ()=>{
+  if(raw.length<10){ alert('Nothing to export. Click "Process & Replay" after drawing.'); return; }
+  const t = raw.map(r=>r[0]), x = raw.map(r=>r[1]), y = raw.map(r=>r[2]);
+  const [tu, xu, yu] = uniformResample(t,x,y, fs);
+  const qref = pathToJoints(xu,yu);
+  const delay = parseFloat($('delay').value)||0;
+  const qref_d = delayRefs(qref, delay, fs);
+  const kp = [parseFloat($('kp1').value)||60, parseFloat($('kp2').value)||40];
+  const kd = [parseFloat($('kd1').value)||0.9, parseFloat($('kd2').value)||0.7];
+  const qrep = replayPD(tu, qref_d, kp, kd);
+  const eeref = qref.map(q=>fk2(q[0], q[1]));
+  const eerep = qrep.map(q=>fk2(q[0], q[1]));
+  const err = eerep.map((p,i)=> Math.hypot(p[0]-eeref[i][0], p[1]-eeref[i][1]));
+
+  let csv = 't_s,x_ref_m,y_ref_m,x_rep_m,y_rep_m,err_m\n';
+  for(let i=0;i<tu.length;i++){
+    csv += `${tu[i]},${eeref[i][0]},${eeref[i][1]},${eerep[i][0]},${eerep[i][1]},${err[i]}\n`;
+  }
+  const blob = new Blob([csv], {type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'mcs_web_results.csv';
+  a.click();
+};
+</script>
+</body>
+</html>
